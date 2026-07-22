@@ -6,16 +6,6 @@ A small TCP HTTP server for Windows written in C++ with the Winsock2 API. The ma
 
 - Windows
 - MSVC (`cl.exe`) — Visual Studio or Build Tools with the C++ workload
-
-## Build
-
-Open an **x64 Native Tools** / **Developer Command Prompt for VS**, then:
-
-```bat
-cd d:\projects\HTTP_CURSOR
-cl /EHsc /std:c++17 main.cpp /Fe:http_server.exe
-```
-
 ## Run
 
 ```bat
