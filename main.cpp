@@ -25,6 +25,8 @@ namespace {
     // doc root for static files
     constexpr const char* kRootDir = "./public";
     constexpr std:: size_t kMaxBodySize = 1024 * 1024;
+    constexpr DWORD kKeepAliveTimeoutMs = 5000;
+    constexpr int kMaxKeepAliveRequests = 100 ;
 
 
     SOCKET g_listenSocket = INVALID_SOCKET;
@@ -70,12 +72,13 @@ namespace {
         return true ;
     }
 
-    bool SendHttpResponse(SOCKET client , int stausCode , const std:: string& statusText , const std::string&contentType , const std:: string& body , bool includeBody) {
-        const std:: string headers = "HTTP/1.1 " + std::to_string(stausCode) + " " + statusText + "\r\n"
-        "Content-Type: " + contentType + "\r\n"
-        "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    bool SendHttpResponse(SOCKET client , int statusCode , const std:: string& statusText , const std::string&contentType , const std:: string& body , bool includeBody , bool keep_alive) {
+        const std::string headers =
+       "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText + "\r\n"
+       "Content-Type: " + contentType + "\r\n"
+       "Content-Length: " + std::to_string(body.size()) + "\r\n"
+       "Connection: " + std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
+       "\r\n";
         if (!SendAll(client , headers.data() , headers.size())) {
             return false ;
         }
@@ -88,9 +91,10 @@ namespace {
     }
 
 // used for cheking the correct request from the client
-    bool req_line(const std:: string& request , std:: string& method , std::string& path) {
+    bool req_line(const std:: string& request , std:: string& method , std::string& path , std::string&version) {
         method.clear();
         path.clear();
+        version.clear();
         const std:: size_t line_end = request.find("\r\n");
         const std::string first_line = (line_end == std::string::npos) ? request : request.substr(0, line_end);
         if (first_line.empty()) {
@@ -106,7 +110,8 @@ namespace {
             return false ;
         }
         path = first_line.substr( first_space + 1 , second_space - first_space - 1 );
-        return !method.empty() && !path.empty();
+        version = first_line.substr(second_space + 1);
+        return !method.empty() && !path.empty() && !version.empty();
     }
     std::string Trim(const std::string& value) {
         const std::size_t start = value.find_first_not_of("\t");
@@ -138,6 +143,7 @@ namespace {
         const std:: size_t pos = request.find("\r\n\r\n");
         return (pos == std::string::npos) ? std::string::npos : pos + 4;
     }
+    /*
     std::optional<std::size_t> ParseContentLength(const std::string&headers) {
         std::size_t pos = 0;
         while (pos < headers.length()) {
@@ -170,7 +176,70 @@ namespace {
         }
         return std::nullopt;
     }
-    bool  RecvAppend(SOCKET client , std::string& buffer) {
+*/
+
+
+    std::optional<std::string> FindHeaderValue(const std::string& headers , const char* name) {
+        std::size_t pos = 0;
+        while (pos < headers.size()) {
+            const std::size_t line_end = headers.find("\r\n");
+            if (line_end == std::string::npos) {
+                break;
+            }
+            const std::string line = headers.substr(pos , line_end  - pos);
+            pos = line_end + 2 ;
+            const std::size_t colon = line.find(':');
+            if (colon == std::string::npos) {
+                continue ;
+            }
+            if (!HeaderNameEquals(line.substr(0,colon) , name)) {
+                continue;
+            }
+            return Trim(line.substr(colon + 1));
+        }
+        return std::nullopt;
+    }
+
+    bool ParseContentLength(const std::string& headers , std::size_t& body_length) {
+        const std::optional<std::string> value = FindHeaderValue(headers , "content-length");
+        if (!value) {
+            body_length = 0;
+            return true ;
+        }else {
+            if (value->empty()) {
+                return false ;
+            }
+            try {
+                const unsigned long long parsed = std::stoull(*value);
+                if (parsed > kMaxBodySize) {
+                    return false ;
+                }
+                body_length = static_cast<std::size_t>(parsed);
+                return true ;
+            }catch (...) {
+                return false ;
+            }
+        }
+    }
+    bool WantsKeepAlive(const std::string&version , const std::string& headers) {
+        const std::optional<std::string> connection = FindHeaderValue(headers , "connection");
+        if (connection) {
+            std::string lower = *connection ;
+            for (char& c : lower) {
+                if (c >= 'A' && c <= 'Z') {
+                    c = static_cast<char>(c - 'A' + 'a');
+                }
+            }
+            if (lower.find("close") != std::string::npos) {
+                return false ;
+            }
+            if (lower.find("keep-alive") != std::string::npos) {
+                return true ;
+            }
+        }
+        return version == "HTTP/1.1";
+    }
+    bool RecvAppend(SOCKET client , std::string& buffer) {
         char chunk[kRecvBufferSize];
         const int received = recv(client ,chunk , sizeof(chunk) , 0);
         if (received == SOCKET_ERROR) {
@@ -183,27 +252,31 @@ namespace {
         buffer.append(chunk , static_cast<std::size_t>(received));
         return true ;
     }
-    bool ReadHTTPRequest(SOCKET client , std::string&request) {
+    bool ReadHTTPRequest(SOCKET client ,std::string& leftover,  std::string&request) {
         request.clear();
         while (true) {
-            const std::size_t header_end = HeaderEndOffset(request);
+            const std::size_t header_end = HeaderEndOffset(leftover);
             if (header_end != std::string::npos) {
-                const std::string headers = request.substr(0 , header_end - 4);
-                const std::optional<std::size_t> content_length = ParseContentLength(headers);
-                const std::size_t body_length = content_length.value_or(0);
+                const std::string headers = leftover.substr(0,header_end);
+                std::size_t body_length = 0;
+                if (!ParseContentLength(headers , body_length)) {
+                    return false;
+                }
                 const std::size_t total_needed = header_end + body_length;
-                while (request.size() < total_needed) {
-                    if (!RecvAppend(client , request)) {
+                while (leftover.size() < total_needed) {
+                    if (!RecvAppend(client , leftover)) {
                         return false;
                     }
                 }
+                request = leftover.substr(0,header_end);
+                leftover.erase(0, total_needed);
                 return true ;
             }
             if (!RecvAppend(client , request)) {
                 return false;
             }
-            if (request.size() > kMaxBodySize + 8912) {
-                return false;
+            if (leftover.size()  > kMaxBodySize + 8912) {
+                return false ;
             }
         }
     }
@@ -241,20 +314,20 @@ namespace {
         }
         return escaped;
     }
-    bool HandlePost(SOCKET client, const std::string& path, const std::string& body) {
+    bool HandlePost(SOCKET client, const std::string& path, const std::string& body , bool keepAlive) {
         if (path != "/api/echo") {
             const std::string responseBody =
                 "<!DOCTYPE html><html><body><h1>404 Not Found</h1>"
                 "<p>No POST handler for this path.</p></body></html>";
             return SendHttpResponse(client, 404, "Not Found", "text/html; charset=utf-8",
-                                    responseBody, true);
+                                    responseBody, true , keepAlive);
         }
 
         const std::string responseBody =
             "{\"path\":\"/api/echo\",\"bytes\":" + std::to_string(body.size()) +
             ",\"body\":\"" + JsonEscape(body) + "\"}";
         return SendHttpResponse(client, 200, "OK", "application/json; charset=utf-8", responseBody,
-                                true);
+                                true , keepAlive);
     }
     const std::unordered_map<std::string, std::string>& MimeTable() {
         static const std::unordered_map<std::string, std::string> kTable = {
@@ -357,67 +430,99 @@ namespace {
         return data;
     }
     void HandleClient(SOCKET client) {
-        char buffer[kRecvBufferSize];
+    const DWORD recvTimeoutMs = kKeepAliveTimeoutMs;
+    if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&recvTimeoutMs),
+                   sizeof(recvTimeoutMs)) == SOCKET_ERROR) {
+        printWinsockError("setsockopt(SO_RCVTIMEO)");
+        closesocket(client);
+        return;
+    }
+
+    std::string leftover;
+    int requestsHandled = 0;
+
+    while (g_running) {
         std::string request;
-        if (!ReadHTTPRequest(client , request)) {
-            closesocket(client);
-            return ;
+        if (!ReadHTTPRequest(client, leftover, request)) {
+            break;
         }
-        const int received = recv(client, buffer, sizeof(buffer) - 1, 0);
-        if (received == SOCKET_ERROR) {
-            printWinsockError(buffer);
-            closesocket(client);
-            return ;
+
+        std::string method;
+        std::string path;
+        std::string version;
+        if (!req_line(request, method, path, version)) {
+            const std::string body =
+                "<!DOCTYPE html><html><body><h1>400 Bad Request</h1>"
+                "<p>Malformed request line.</p></body></html>";
+            SendHttpResponse(client, 400, "Bad Request", "text/html; charset=utf-8", body, true,
+                             false);
+            break;
         }
-        if (received == 0) {
-            closesocket(client);
-            return ;
+
+        const std::size_t headerEnd = HeaderEndOffset(request);
+        const std::string headers =
+            (headerEnd == std::string::npos) ? std::string{} : request.substr(0, headerEnd - 4);
+
+        bool keepAlive = WantsKeepAlive(version, headers);
+        if (requestsHandled + 1 >= kMaxKeepAliveRequests) {
+            keepAlive = false;
         }
-        buffer[received] = '\0';
-        //const std:: string request(buffer , static_cast<size_t>(received));
-        std::string method ;
-        std:: string path ;
-        if (!req_line(request, method, path)) {
-            const std:: string body ="<!DOCTYPE html><html><body><h1>400 Bad Request</h1>"
-            "<p>Malformed request line.</p></body></html>";
-            SendHttpResponse(client , 400 , "Bad request" , "text/html; charset=utf-8" , body , true);
-            closesocket(client);
-            return ;
-        }
+
         if (method == "POST") {
             const std::string body = RequestBody(request);
-            HandlePost(client , path , body );
-            closesocket(client);
-            return;
+            if (!HandlePost(client, path, body, keepAlive)) {
+                break;
+            }
+        } else if (method == "GET" || method == "HEAD") {
+            const bool includeBody = (method == "GET");
+
+            const std::optional<std::string> resolved = ResolveSafePath(path);
+            if (!resolved) {
+                const std::string body =
+                    "<!DOCTYPE html><html><body><h1>400 Bad Request</h1>"
+                    "<p>Invalid or unsafe path.</p></body></html>";
+                if (!SendHttpResponse(client, 400, "Bad Request", "text/html; charset=utf-8", body,
+                                      includeBody, keepAlive)) {
+                    break;
+                }
+            } else {
+                const std::optional<std::string> fileBytes = ReadFileFromBinary(*resolved);
+                if (!fileBytes) {
+                    const std::string body =
+                        "<!DOCTYPE html><html><body><h1>404 Not Found</h1>"
+                        "<p>The requested file was not found.</p></body></html>";
+                    if (!SendHttpResponse(client, 404, "Not Found", "text/html; charset=utf-8", body,
+                                          includeBody, keepAlive)) {
+                        break;
+                    }
+                } else {
+                    const std::string contentType = MimeForPath(*resolved);
+                    if (!SendHttpResponse(client, 200, "OK", contentType, *fileBytes, includeBody,
+                                          keepAlive)) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            const std::string body =
+                "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1>"
+                "<p>Only GET, HEAD, and POST are supported.</p></body></html>";
+            if (!SendHttpResponse(client, 405, "Method Not Allowed", "text/html; charset=utf-8",
+                                  body, true, keepAlive)) {
+                break;
+            }
         }
-        if (method != "GET" && method != "HEAD") {
-            const std::string body = "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1>"
-            "<p>Only GET,HEAD and POST are supported.</p></body></html>";
-            SendHttpResponse(client , 405 , "Method Not Allowed" , "text/html", body , true);
-            closesocket(client);
-            return;
+
+        ++requestsHandled;
+        if (!keepAlive) {
+            break;
         }
-        const bool includeBody = (method == "GET");
-        const std::optional<std::string> resolved = ResolveSafePath(path);
-        if (!resolved) {
-            const std:: string body = "<!DOCTYPE html><html><body><h1>400 Bad Request</h1>"
-            "<p>Invalid or unsafe path.</p></body></html>";
-            SendHttpResponse(client , 400 , "Bad request" , "txt/html", body , true);
-            closesocket(client);
-            return ;
-        }
-        const std::optional<std::string> file_bytes = ReadFileFromBinary(*resolved);
-        if (!file_bytes) {
-            const std::string body =  "<!DOCTYPE html><html><body><h1>404 Not Found</h1>"
-            "<p>The requested file was not found.</p></body></html>";
-            SendHttpResponse(client, 404, "Not Found", "text/html; charset=utf-8", body, includeBody);
-            closesocket(client);
-            return;
-        }
-        const std::string content_type = MimeForPath(*resolved);
-        SendHttpResponse(client , 200 , "OK" , content_type , *file_bytes , includeBody);
-        closesocket(client);
     }
+
+    // Windows: closesocket(). Linux/POSIX: close().
+    closesocket(client);
+}
 
 };
 
