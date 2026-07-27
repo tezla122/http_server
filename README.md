@@ -4,17 +4,17 @@
 
 This project is a teaching-oriented TCP HTTP server for Windows, implemented in a single C++ file using the native **Winsock2** API (not POSIX sockets).
 
-It walks through the real Windows socket lifecycle: `WSAStartup`, create a listening socket, set options, `bind`, `listen`, then accept clients on the main thread. Each accepted connection is handed to a new `std::thread`, which reads a full HTTP request (headers and optional body), parses the request line (`METHOD PATH VERSION`), and responds. The client socket is then closed (`closesocket`).
+It walks through the real Windows socket lifecycle: `WSAStartup`, create a listening socket, set options, `bind`, `listen`, then accept clients on the main thread. Each accepted connection is handed to a new `std::thread`, which reads HTTP requests (headers and optional body), parses the request line (`METHOD PATH VERSION`), and responds. With **keep-alive**, the same connection can handle multiple requests before `closesocket`.
 
 Supported methods:
 
 - **GET / HEAD** — serve static files from `./public` (MIME types, path traversal checks, 404 for missing files)
 - **POST** — demo endpoint at `/api/echo` that returns the request body as JSON
 
-The server is intentionally minimal — no keep-alive, HTTPS, or thread pool — so the Winsock and multithreading flow stay easy to follow. Ctrl+C triggers a clean shutdown by closing the listen socket, joining worker threads, and calling `WSACleanup`. Inline comments call out where Windows differs from Linux (`SOCKET` vs `int`, `closesocket` vs `close`, `WSAGetLastError` vs `errno`, and so on).
+The server is intentionally minimal — no HTTPS or thread pool — so the Winsock and multithreading flow stay easy to follow. Ctrl+C triggers a clean shutdown by closing the listen socket, joining worker threads, and calling `WSACleanup`. Inline comments call out where Windows differs from Linux (`SOCKET` vs `int`, `closesocket` vs `close`, `WSAGetLastError` vs `errno`, and so on).
 
 **Short blurb (for GitHub / portfolio):**  
-Windows C++ multithreaded HTTP server built with Winsock2 — accept loop on the main thread, one worker thread per connection, static file serving plus a simple POST echo API.
+Windows C++ multithreaded HTTP server built with Winsock2 — accept loop on the main thread, one worker thread per connection, static file serving, POST echo, and HTTP keep-alive.
 
 ## Requirements
 
@@ -65,6 +65,9 @@ curl.exe -I http://127.0.0.1:8080/index.html
 
 # POST echo API
 curl.exe -X POST http://127.0.0.1:8080/api/echo -d "hello"
+
+# Keep-alive: two requests on one connection
+curl.exe --http1.1 -H "Connection: keep-alive" http://127.0.0.1:8080/ http://127.0.0.1:8080/about.txt
 ```
 
 Expected POST response:
@@ -85,15 +88,16 @@ You can also open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) in a browser 
 | Path safety | Rejects `..` segments and drive-like paths (e.g. `/C:/...`) |
 | POST | `/api/echo` returns body as JSON; other POST paths → 404 |
 | Request read | Headers + body via `Content-Length` (max 1 MiB body) |
+| Keep-alive | HTTP/1.1 default; honors `Connection`; 5s idle timeout; max 100 requests/connection |
 | Status codes | 200, 400, 404, 405 |
 | Shutdown | Ctrl+C closes the listen socket, joins workers, then `WSACleanup` |
 
 ## Known limitations
 
-- No keep-alive (one request per connection)
 - No chunked transfer encoding (clients must send `Content-Length`)
 - POST only implements `/api/echo`
 - Single-file design; no routing framework or thread pool
+- Keep-alive idle timeout is fixed at 5 seconds (`SO_RCVTIMEO`)
 
 ## Layout
 
