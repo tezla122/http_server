@@ -8,6 +8,35 @@
 <body>
 <h1>Static file serving works</h1>
 <p>This page is <code>public/index.html</code>, served by the Winsock HTTP server.</p>
-<p><a href="/about">about.txt</a></p>
+<p><a href="/about.txt">about.txt</a></p>
+
+<h2>POST demo</h2>
+<form id="echo-form">
+    <label for="message">Message:</label>
+    <input id="message" name="message" type="text" value="hello from the browser">
+    <button type="submit">POST to /api/echo</button>
+</form>
+<pre id="echo-result">Submit the form to see the JSON response.</pre>
+
+<script>
+    document.getElementById('echo-form').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const message = document.getElementById('message').value;
+        const result = document.getElementById('echo-result');
+        result.textContent = 'Sending...';
+
+        try {
+            const response = await fetch('/api/echo', {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+                body: message
+            });
+            const text = await response.text();
+            result.textContent = 'HTTP ' + response.status + '\n' + text;
+        } catch (error) {
+            result.textContent = 'Request failed: ' + error;
+        }
+    });
+</script>
 </body>
 </html>
